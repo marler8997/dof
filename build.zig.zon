@@ -1,0 +1,11 @@
+.{
+    .name = .dof,
+    .fingerprint = 0xf62b09eb51243f97,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
