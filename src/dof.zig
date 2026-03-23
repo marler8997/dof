@@ -51,26 +51,29 @@ pub fn main() !void {
     try std.fs.cwd().makePath(app_data_path);
 
     if (opt.update) {
-        const src = try std.fs.path.join(arena, &.{ app_data_path, "src" });
-        defer arena.free(src);
+        // TODO: use "hew" to update?
+        @panic("todo: use hew to update?");
 
-        const src_lock_path = try std.mem.concat(arena, u8, &.{ src, ".lock" });
-        defer arena.free(src_lock_path);
+        // const src = try std.fs.path.join(arena, &.{ app_data_path, "src" });
+        // defer arena.free(src);
 
-        const master = blk: {
-            break :blk try fetchDofMaster(src, src_lock_path, arena);
-        };
-        if (!std.mem.eql(u8, &master, &build_options.sha)) {
-            std.log.info("running: {s}", .{&build_options.sha});
-            std.log.info("master : {s}", .{&master});
-            try updateExecNoreturn(
-                arena,
-                src,
-                src_lock_path,
-                &master,
-            );
-        }
-        std.log.info("already running master ({s})", .{&build_options.sha});
+        // const src_lock_path = try std.mem.concat(arena, u8, &.{ src, ".lock" });
+        // defer arena.free(src_lock_path);
+
+        // const master = blk: {
+        //     break :blk try fetchDofMaster(src, src_lock_path, arena);
+        // };
+        // if (!std.mem.eql(u8, &master, &build_options.sha)) {
+        //     std.log.info("running: {s}", .{&build_options.sha});
+        //     std.log.info("master : {s}", .{&master});
+        //     try updateExecNoreturn(
+        //         arena,
+        //         src,
+        //         src_lock_path,
+        //         &master,
+        //     );
+        // }
+        // std.log.info("already running master ({s})", .{&build_options.sha});
     }
 
     return switch (opt.sub_command) {
