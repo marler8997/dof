@@ -351,6 +351,10 @@ fn lex(text: []const u8, lex_start: usize) Token {
             .start => {
                 switch (text[index]) {
                     ' ', '\n', '\t', '\r' => index += 1,
+                    '#' => {
+                        state = .line_comment;
+                        index += 1;
+                    },
                     '"' => {
                         state = .{ .string = index };
                         index += 1;
@@ -968,6 +972,25 @@ test "lex directive and path" {
     try std.testing.expectEqual(Token.Tag.identifier, path.tag);
     try std.testing.expectEqualStrings("emacs/init.el", text[path.start..path.end]);
     try std.testing.expectEqual(Token.Tag.eof, lex(text, path.end).tag);
+}
+
+test "lex skips comments" {
+    const text =
+        \\# Link Emacs config
+        \\emacs-load-file emacs/init.el
+        \\
+        \\# Copy Claude config to home directory
+        \\install-home .claude # trailing comment
+        \\# last line
+    ;
+    var offset: usize = 0;
+    for ([_][]const u8{ "emacs-load-file", "emacs/init.el", "install-home", ".claude" }) |expected| {
+        const token = lex(text, offset);
+        try std.testing.expectEqual(Token.Tag.identifier, token.tag);
+        try std.testing.expectEqualStrings(expected, text[token.start..token.end]);
+        offset = token.end;
+    }
+    try std.testing.expectEqual(Token.Tag.eof, lex(text, offset).tag);
 }
 
 test "getLineCol" {
