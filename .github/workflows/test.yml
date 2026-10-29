@@ -10,20 +10,33 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-          - os: macos-15
-            xcode: "16.4"
+          - os: macos-latest
           - os: windows-latest
           - os: windows-11-arm
       fail-fast: false
     runs-on: ${{matrix.os}}
     steps:
       - uses: actions/checkout@v7
-      - if: ${{ matrix.xcode }}
-        name: select xcode
-        # zig 0.15 can't link against the newer Xcode SDKs (undefined libSystem symbols)
-        run: |
-          sudo xcode-select -s /Applications/Xcode_${{ matrix.xcode }}.app
-          xcrun --show-sdk-path
       - uses: marler8997/setup-anyzig@master
       - run: zig build test --summary all
       - run: zig build install -Dsha=${{ github.sha }} --summary all
+      # the windows installer has a separate path for replacing a running exe
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # stop on a native command's non-zero exit code too
+          $PSNativeCommandUseErrorActionPreference = $true
+          # quoted, pwsh splits unquoted '-x=y.exe' into '-x=y' '.exe'
+          zig build-exe src/installwindows.zig '-femit-bin=install.exe'
+          $prefix = "$PWD\installtest"
+          New-Item -ItemType Directory $prefix | Out-Null
+          Copy-Item "$env:SystemRoot\System32\PING.EXE" $prefix\dof.exe
+          $running = Start-Process $prefix\dof.exe -ArgumentList '-n','60','127.0.0.1' -PassThru -WindowStyle Hidden
+          .\install.exe --prefix $prefix --exe zig-out\dof.exe --pdb zig-out\dof.pdb
+          if (!(Test-Path $prefix\dof.exe.old)) { throw "the running exe wasn't moved aside" }
+          $running.Kill(); $running.WaitForExit()
+          Remove-Item $prefix\dof.exe.old
+          .\install.exe --prefix $prefix --exe zig-out\dof.exe --pdb zig-out\dof.pdb
+          if (Test-Path $prefix\dof.exe.old) { throw "an exe that wasn't running was moved aside" }
+          if ((Get-FileHash $prefix\dof.exe).Hash -ne (Get-FileHash zig-out\dof.exe).Hash) { throw "installed exe differs" }
+          if (Test-Path $prefix\dof.exe.new) { throw "leftover dof.exe.new" }
