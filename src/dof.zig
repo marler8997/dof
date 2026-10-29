@@ -937,3 +937,20 @@ const builtin = @import("builtin");
 const std = @import("std");
 const stdfix = @import("stdfix.zig");
 const LockFile = @import("LockFile.zig");
+
+test "lex directive and path" {
+    const text = "emacs-load-file emacs/init.el\n";
+    const directive = lex(text, 0);
+    try std.testing.expectEqual(Token.Tag.identifier, directive.tag);
+    try std.testing.expectEqualStrings("emacs-load-file", text[directive.start..directive.end]);
+    const path = lex(text, directive.end);
+    try std.testing.expectEqual(Token.Tag.identifier, path.tag);
+    try std.testing.expectEqualStrings("emacs/init.el", text[path.start..path.end]);
+    try std.testing.expectEqual(Token.Tag.eof, lex(text, path.end).tag);
+}
+
+test "getLineCol" {
+    const text = "ab\ncd";
+    try std.testing.expectEqual(.{ 1, 1 }, getLineCol(text, 0));
+    try std.testing.expectEqual(.{ 2, 2 }, getLineCol(text, 4));
+}

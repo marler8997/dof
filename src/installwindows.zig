@@ -27,6 +27,7 @@ pub fn main() !void {
             .pdb = maybe_pdb orelse errExit("missing --pdb cmdline option", .{}),
         };
     };
+    try std.fs.cwd().makePath(opt.prefix);
     try install(arena, opt.prefix, opt.exe);
     try install(arena, opt.prefix, opt.pdb);
 }

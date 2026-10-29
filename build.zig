@@ -33,6 +33,15 @@ pub fn build(b: *std.Build) void {
     // if (b.args) |a| run.addArgs(a);
     // b.step("run", "").dependOn(&run.step);
 
+    const test_exe = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dof.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.step("test", "Run the unit tests").dependOn(&b.addRunArtifact(test_exe).step);
+
     // on windows, we use our own installer so we can overwrite the dof.exe while
     // it's running
     if (builtin.os.tag == .windows) {
