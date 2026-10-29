@@ -1,6 +1,16 @@
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // not standardOptimizeOption, it defaults to debug and the install scripts
+    // and self-update run a plain `zig build install`
+    const optimize: std.builtin.Optimize = b.option(
+        std.builtin.Optimize,
+        "optimize",
+        "Prioritize performance, safety, or binary size (default: safe)",
+    ) orelse switch (b.graph.release_mode) {
+        .off, .any, .safe => .safe,
+        .fast => .fast,
+        .small => .small,
+    };
 
     const maybe_sha = b.option([]const u8, "sha", "The SHA to embed inside the exe");
 
@@ -55,7 +65,7 @@ pub fn build(b: *std.Build) void {
         });
         const install_dof = b.addRunArtifact(install_exe);
         install_dof.addArg("--prefix");
-        install_dof.addArg(b.install_prefix);
+        install_dof.addDirectoryArg2(.{ .relative = .{ .base = .install_prefix } }, .{ .make_absolute = true });
         install_dof.addArg("--exe");
         install_dof.addArtifactArg(dof_exe);
         if (target.result.os.tag == .windows) {
