@@ -52,6 +52,33 @@ pub fn build(b: *std.Build) void {
     });
     b.step("test", "Run the unit tests").dependOn(&b.addRunArtifact(test_exe).step);
 
+    {
+        // the e2e tests always pass --no-update so the sha is never used
+        const e2e_dof_options = b.addOptions();
+        const zero_sha: [40]u8 = @splat('0');
+        e2e_dof_options.addOption([40]u8, "sha", zero_sha);
+        const e2e_dof = b.addExecutable(.{
+            .name = "dof",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/dof.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        e2e_dof.root_module.addOptions("build_options", e2e_dof_options);
+        const e2e_options = b.addOptions();
+        e2e_options.addOptionPath("dof_exe", e2e_dof.getEmittedBin());
+        const e2e_exe = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/e2e.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        e2e_exe.root_module.addOptions("e2e_options", e2e_options);
+        b.step("e2e", "Run the end-to-end tests (needs git)").dependOn(&b.addRunArtifact(e2e_exe).step);
+    }
+
     // on windows, we use our own installer so we can overwrite the dof.exe while
     // it's running
     if (builtin.os.tag == .windows) {
