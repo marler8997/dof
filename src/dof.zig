@@ -70,9 +70,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const src = try std.fs.path.join(arena, &.{ app_data_path, "src" });
         defer arena.free(src);
 
-        const master = blk: {
-            break :blk try fetchDofMaster(io, app_data_dir, src, arena);
-        };
+        // held from the fetch until the updated exe is running so another dof
+        // can't change src or the installed exe in between
+        const src_lock = try lockfile.lock(io, app_data_dir, "src.lock");
+        defer src_lock.close(io);
+
+        const master = try fetchDofMaster(io, src, arena);
         if (!std.mem.eql(u8, &master, &build_options.sha)) {
             std.log.info("running: {s}", .{&build_options.sha});
             std.log.info("master : {s}", .{&master});
@@ -80,7 +83,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 io,
                 arena,
                 try init.args.toSlice(arena),
-                app_data_dir,
+                src_lock,
                 src,
                 &master,
             );
@@ -791,7 +794,8 @@ fn updateExecNoreturn(
     io: std.Io,
     arena: std.mem.Allocator,
     args: []const [:0]const u8,
-    app_data_dir: std.Io.Dir,
+    /// released once the updated exe is running
+    src_lock: std.Io.File,
     src: []const u8,
     master: *const [40]u8,
 ) !noreturn {
@@ -800,23 +804,18 @@ fn updateExecNoreturn(
     // exe must be absolute path since we run zig from the src directory
     std.debug.assert(std.fs.path.isAbsolute(exe));
 
-    {
-        // also serializes installing the exe, which only happens here
-        const src_lock = try lockfile.lock(io, app_data_dir, "src.lock");
-        defer src_lock.close(io);
-        try run(io, &.{ "git", "-C", src, "reset", "--hard", master }, null);
-        const prefix = "-Dsha=";
-        var sha_arg_buf: [prefix.len + 40]u8 = undefined;
-        const sha_arg = std.fmt.bufPrint(&sha_arg_buf, prefix ++ "{s}", .{master}) catch unreachable;
-        try run(io, &.{
-            "zig",
-            "build",
-            "install",
-            sha_arg,
-            "--prefix",
-            std.fs.path.dirname(exe).?,
-        }, src);
-    }
+    try run(io, &.{ "git", "-C", src, "reset", "--hard", master }, null);
+    const prefix = "-Dsha=";
+    var sha_arg_buf: [prefix.len + 40]u8 = undefined;
+    const sha_arg = std.fmt.bufPrint(&sha_arg_buf, prefix ++ "{s}", .{master}) catch unreachable;
+    try run(io, &.{
+        "zig",
+        "build",
+        "install",
+        sha_arg,
+        "--prefix",
+        std.fs.path.dirname(exe).?,
+    }, src);
 
     // Re-exec the newly built dof with --no-update plus all original args.
     const argv = try arena.alloc([]const u8, args.len + 1);
@@ -825,21 +824,26 @@ fn updateExecNoreturn(
     for (args[1..], argv[2..]) |a, *dst| dst.* = a;
     if (builtin.os.tag == .windows) {
         var child = try std.process.spawn(io, .{ .argv = argv });
-        const term = try child.wait(io);
-        switch (term) {
-            .exited => |code| std.process.exit(code),
-            else => errExit("{s} {f}", .{ exe, term }),
-        }
+        unlockAndExitWithChild(io, src_lock, &child, exe);
     } else {
+        // src_lock is close-on-exec, the exec releases it
         const err = std.process.replace(io, .{ .argv = argv });
         errExit("exec '{s}' failed: {t}", .{ exe, err });
     }
 }
 
-fn fetchDofMaster(io: std.Io, app_data_dir: std.Io.Dir, src: []const u8, arena: std.mem.Allocator) ![40]u8 {
-    const src_lock = try lockfile.lock(io, app_data_dir, "src.lock");
-    defer src_lock.close(io);
+/// Not an error union, the caller's defer would close src_lock again.
+fn unlockAndExitWithChild(io: std.Io, src_lock: std.Io.File, child: *std.process.Child, exe: []const u8) noreturn {
+    // the child doesn't need src.lock, don't keep other dofs waiting on it
+    src_lock.close(io);
+    const term = child.wait(io) catch |err| errExit("wait for '{s}' failed with {t}", .{ exe, err });
+    switch (term) {
+        .exited => |code| std.process.exit(code),
+        else => errExit("{s} {f}", .{ exe, term }),
+    }
+}
 
+fn fetchDofMaster(io: std.Io, src: []const u8, arena: std.mem.Allocator) ![40]u8 {
     const src_exists = blk: {
         var dir = std.Io.Dir.cwd().openDir(io, src, .{}) catch |err| switch (err) {
             error.FileNotFound => break :blk false,
