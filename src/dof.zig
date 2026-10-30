@@ -138,60 +138,243 @@ fn defaultCommand(
     const config_dof_path = try std.fs.path.join(arena, &.{ repo_path, "config.dof" });
     defer arena.free(config_dof_path);
 
-    switch (try gitStatus(io, repo_path)) {
-        .dirty => {
-            if (!interactive) errExit("repo is dirty and --non-interactive is preset", .{});
-            std.log.info("repo is dirty", .{});
-            {
-                const repo_lock = try lockfile.lock(io, app_data_dir, "dotfiles.lock");
-                defer repo_lock.close(io);
-                try runDof(io, arena, environ, repo_path, config_dof_path);
-            }
-            switch (try prompt(io, "dof changes applied, push?")) {
-                .yes => {},
-                .no => {
-                    std.log.info("user answered no", .{});
-                    std.process.exit(0xff);
-                },
-            }
+    // held across the prompts so another dof can't change the repo while you decide
+    const repo_lock = try lockfile.lock(io, app_data_dir, "dotfiles.lock");
+    defer repo_lock.close(io);
 
-            {
-                const repo_lock = try lockfile.lock(io, app_data_dir, "dotfiles.lock");
-                defer repo_lock.close(io);
-                try run(io, &.{ "git", "-C", repo_path, "add", "-A" }, null);
-                try run(io, &.{ "git", "-C", repo_path, "diff", "--cached", "--stat" }, null);
-
-                switch (try prompt(io, "commit and push these changes?")) {
-                    .yes => {},
-                    .no => {
-                        try run(io, &.{ "git", "-C", repo_path, "reset" }, null);
-                        std.log.info("changes left uncommitted", .{});
-                        std.process.exit(0xff);
-                    },
-                }
-
-                const commit_msg = try promptLine(io, arena, "commit message: ");
-                defer arena.free(commit_msg);
-                try run(io, &.{ "git", "-C", repo_path, "commit", "-m", commit_msg }, null);
-                try run(io, &.{ "git", "-C", repo_path, "fetch", "origin", branch }, null);
-                if (try runExitCode(io, &.{ "git", "-C", repo_path, "rebase", "FETCH_HEAD" }, null) != 0) {
-                    try run(io, &.{ "git", "-C", repo_path, "rebase", "--abort" }, null);
-                    errExit("rebase failed, resolve conflicts manually in '{s}'", .{repo_path});
-                }
-                // run dof again after rebase
-                try runDof(io, arena, environ, repo_path, config_dof_path);
-                try run(io, &.{ "git", "-C", repo_path, "push", "origin", branch }, null);
-            }
-        },
-        .clean => {
-            std.log.info("repo is clean", .{});
-            const repo_lock = try lockfile.lock(io, app_data_dir, "dotfiles.lock");
-            defer repo_lock.close(io);
-            try run(io, &.{ "git", "-C", repo_path, "fetch", "origin", branch }, null);
-            try run(io, &.{ "git", "-C", repo_path, "reset", "--hard", "FETCH_HEAD" }, null);
-            try runDof(io, arena, environ, repo_path, config_dof_path);
-        },
+    {
+        var buf: [1000]u8 = undefined;
+        const head = std.mem.trimEnd(u8, try runOutput(io, &buf, &.{ "git", "-C", repo_path, "rev-parse", "--abbrev-ref", "HEAD" }), "\n");
+        if (!std.mem.eql(u8, head, branch)) errExit(
+            "repo '{s}' has '{s}' checked out but dof's branch is '{s}'",
+            .{ repo_path, head, branch },
+        );
     }
+
+    try run(io, &.{ "git", "-C", repo_path, "fetch", "origin", branch }, null);
+    const remote = try revParse(io, repo_path, "FETCH_HEAD");
+    const ahead = blk: {
+        var buf: [30]u8 = undefined;
+        const out = try runOutput(io, &buf, &.{ "git", "-C", repo_path, "rev-list", "--count", remote ++ "..HEAD" });
+        const trimmed = std.mem.trimEnd(u8, out, "\n");
+        break :blk std.fmt.parseInt(u32, trimmed, 10) catch errExit("invalid commit count '{s}' from git rev-list", .{trimmed});
+    };
+    const dirty = try runAnyOutput(io, &.{ "git", "-C", repo_path, "status", "--porcelain" });
+
+    if (ahead == 0 and !dirty) {
+        try run(io, &.{ "git", "-C", repo_path, "merge", "--ff-only", &remote }, null);
+        try runDof(io, arena, environ, repo_path, config_dof_path);
+        return;
+    }
+
+    if (!interactive) errExit("repo '{s}' has local changes and --non-interactive was given", .{repo_path});
+    std.log.info("repo has local changes, applying them", .{});
+    try runDof(io, arena, environ, repo_path, config_dof_path);
+
+    const merge_base = blk: {
+        var buf: [100]u8 = undefined;
+        const out = std.mem.trimEnd(u8, try runOutput(io, &buf, &.{ "git", "-C", repo_path, "merge-base", "HEAD", &remote }), "\n");
+        if (out.len != 40 or !validSha(out[0..40])) errExit("invalid merge base '{s}' from git merge-base", .{out});
+        break :blk out[0..40].*;
+    };
+
+    var stdin_buf: [1000]u8 = undefined;
+    var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buf);
+
+    var offer_view = try showLocalChanges(io, arena, repo_path, &merge_base, ahead, .shorten);
+    while (true) switch (try promptChoice(io, &stdin, offer_view)) {
+        .view => {
+            _ = try showLocalChanges(io, arena, repo_path, &merge_base, ahead, .full);
+            offer_view = false;
+        },
+        .push => {
+            if (dirty) {
+                const commit_msg = try promptLine(io, &stdin, arena, "commit message: ");
+                defer arena.free(commit_msg);
+                try run(io, &.{ "git", "-C", repo_path, "add", "-A" }, null);
+                try run(io, &.{ "git", "-C", repo_path, "commit", "-m", commit_msg }, null);
+            }
+            if (try runExitCode(io, &.{ "git", "-C", repo_path, "rebase", &remote }, null) != 0) {
+                try run(io, &.{ "git", "--no-pager", "-C", repo_path, "diff", "--name-only", "--diff-filter=U" }, null);
+                try run(io, &.{ "git", "-C", repo_path, "rebase", "--abort" }, null);
+                errExit(
+                    "rebasing onto origin/{s} conflicted in the files above, the rebase was aborted (your commits are still in '{s}'), resolve it and run dof again",
+                    .{ branch, repo_path },
+                );
+            }
+            if (try runExitCode(io, &.{ "git", "-C", repo_path, "push", "origin", branch }, null) != 0) errExit(
+                "push failed, if origin/{s} has new commits run dof again",
+                .{branch},
+            );
+            try runDof(io, arena, environ, repo_path, config_dof_path);
+            return;
+        },
+        .save => {
+            var name_buf: [100]u8 = undefined;
+            const name = fmtSaveBranch(io, &name_buf);
+            try moveLocalChanges(io, repo_path, branch, &remote, dirty, name, "dof: saved local changes");
+            std.log.info("local changes saved to branch '{s}'", .{name});
+            try runDof(io, arena, environ, repo_path, config_dof_path);
+            return;
+        },
+        .discard => {
+            const name = "dof-discarded";
+            switch (try runExitCode(io, &.{ "git", "-C", repo_path, "show-ref", "--verify", "--quiet", "refs/heads/" ++ name }, null)) {
+                0 => try run(io, &.{ "git", "-C", repo_path, "branch", "-D", name }, null),
+                1 => {},
+                else => |code| errExit("git show-ref exited with code {d}", .{code}),
+            }
+            try moveLocalChanges(io, repo_path, branch, &remote, dirty, name, "dof: discarded local changes");
+            std.log.info("local changes discarded, they're on branch '{s}' until the next discard", .{name});
+            try runDof(io, arena, environ, repo_path, config_dof_path);
+            return;
+        },
+        .quit => return,
+    };
+}
+
+/// Moves local commits and uncommitted changes (including untracked files) to a new
+/// branch, then resets `branch` to `remote`.
+fn moveLocalChanges(
+    io: std.Io,
+    repo_path: []const u8,
+    branch: []const u8,
+    remote: *const [40]u8,
+    dirty: bool,
+    new_branch: []const u8,
+    commit_msg: []const u8,
+) !void {
+    try run(io, &.{ "git", "-C", repo_path, "switch", "--create", new_branch }, null);
+    if (dirty) {
+        try run(io, &.{ "git", "-C", repo_path, "add", "-A" }, null);
+        try run(io, &.{ "git", "-C", repo_path, "commit", "-m", commit_msg }, null);
+    }
+    try run(io, &.{ "git", "-C", repo_path, "switch", "--force-create", branch, remote }, null);
+}
+
+/// dof-saved-<date>-<time> in UTC
+fn fmtSaveBranch(io: std.Io, buf: []u8) []const u8 {
+    const now: std.time.epoch.EpochSeconds = .{ .secs = @intCast(std.Io.Clock.real.now(io).toSeconds()) };
+    const year_day = now.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = now.getDaySeconds();
+    return std.fmt.bufPrint(buf, "dof-saved-{d}-{d:0>2}-{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    }) catch unreachable;
+}
+
+const max_shown_file_lines = 40;
+const max_shown_lines = 200;
+
+/// Prints unpushed commits and the diff of every changed file against `merge_base`,
+/// including untracked files. With .shorten, a file whose diff is too large (or doesn't
+/// fit in what's left of max_shown_lines) is printed as its name and line counts.
+/// Returns whether any diff was shortened.
+fn showLocalChanges(
+    io: std.Io,
+    scratch: std.mem.Allocator,
+    repo_path: []const u8,
+    merge_base: *const [40]u8,
+    ahead: u32,
+    mode: enum { shorten, full },
+) !bool {
+    var stdout_buf: [1000]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
+    const w = &stdout.interface;
+
+    if (ahead > 0) {
+        w.print("\n{d} unpushed commit(s):\n", .{ahead}) catch return stdout.err.?;
+        w.flush() catch return stdout.err.?;
+        try run(io, &.{ "git", "--no-pager", "-C", repo_path, "log", "--oneline", merge_base ++ "..HEAD" }, null);
+    }
+    w.writeAll("\nchanges:\n") catch return stdout.err.?;
+    w.flush() catch return stdout.err.?;
+
+    var shortened = false;
+    var lines_left: u64 = max_shown_lines;
+
+    const numstat = try runOutputAlloc(io, scratch, &.{ "git", "-C", repo_path, "diff", "--numstat", "-z", "--no-renames", merge_base }, 10 * 1024 * 1024);
+    defer scratch.free(numstat);
+    var numstat_it = std.mem.splitScalar(u8, numstat, 0);
+    while (numstat_it.next()) |entry| {
+        if (entry.len == 0) continue;
+        // <added>\t<removed>\t<path>, "-" for both counts on binary files
+        var field_it = std.mem.splitScalar(u8, entry, '\t');
+        const added = field_it.next().?;
+        const removed = field_it.next() orelse errExit("invalid git diff --numstat entry '{s}'", .{entry});
+        const path = field_it.rest();
+        const binary = std.mem.eql(u8, added, "-");
+        const lines: u64 = if (binary) 0 else (std.fmt.parseInt(u64, added, 10) catch errExit("invalid git diff --numstat entry '{s}'", .{entry})) +
+            (std.fmt.parseInt(u64, removed, 10) catch errExit("invalid git diff --numstat entry '{s}'", .{entry}));
+        if (mode == .shorten and (binary or lines > max_shown_file_lines or lines > lines_left)) {
+            shortened = true;
+            if (binary) {
+                w.print("{s}: binary\n", .{path}) catch return stdout.err.?;
+            } else {
+                w.print("{s}: +{s} -{s}\n", .{ path, added, removed }) catch return stdout.err.?;
+            }
+            w.flush() catch return stdout.err.?;
+        } else {
+            lines_left -|= lines;
+            var pathspec_buf: [std.fs.max_path_bytes + 20]u8 = undefined;
+            const pathspec = std.fmt.bufPrint(&pathspec_buf, ":(literal){s}", .{path}) catch errExit("path too long '{s}'", .{path});
+            try run(io, &.{ "git", "--no-pager", "-C", repo_path, "diff", merge_base, "--", pathspec }, null);
+        }
+    }
+
+    const untracked = try runOutputAlloc(io, scratch, &.{ "git", "-C", repo_path, "ls-files", "--others", "--exclude-standard", "-z" }, 10 * 1024 * 1024);
+    defer scratch.free(untracked);
+    var repo_dir = try std.Io.Dir.cwd().openDir(io, repo_path, .{});
+    defer repo_dir.close(io);
+    var untracked_it = std.mem.splitScalar(u8, untracked, 0);
+    while (untracked_it.next()) |path| {
+        if (path.len == 0) continue;
+        const maybe_lines = try countLines(io, repo_dir, path);
+        if (mode == .shorten and (maybe_lines == null or maybe_lines.? > max_shown_file_lines or maybe_lines.? > lines_left)) {
+            shortened = true;
+            if (maybe_lines) |lines| {
+                w.print("{s}: new file, {d} lines\n", .{ path, lines }) catch return stdout.err.?;
+            } else {
+                w.print("{s}: new binary file\n", .{path}) catch return stdout.err.?;
+            }
+            w.flush() catch return stdout.err.?;
+        } else {
+            lines_left -|= maybe_lines orelse 0;
+            const argv: []const []const u8 = &.{ "git", "--no-pager", "-C", repo_path, "diff", "--no-index", "--", "/dev/null", path };
+            // exits with 1 when the files differ
+            switch (try runExitCode(io, argv, null)) {
+                0, 1 => {},
+                else => |code| errExit("git diff --no-index exited with code {d}", .{code}),
+            }
+        }
+    }
+    return shortened;
+}
+
+/// Returns null for a binary file (one with a 0 byte in its first 8000 bytes, like git).
+fn countLines(io: std.Io, dir: std.Io.Dir, path: []const u8) !?u64 {
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var reader = file.readerStreaming(io, &.{});
+    var offset: u64 = 0;
+    var lines: u64 = 0;
+    var last: u8 = '\n';
+    while (true) {
+        const len = reader.interface.readSliceShort(&buf) catch return reader.err.?;
+        if (len == 0) break;
+        const data = buf[0..len];
+        if (offset < 8000 and std.mem.indexOfScalar(u8, data[0..@min(len, 8000 - offset)], 0) != null) return null;
+        lines += std.mem.count(u8, data, "\n");
+        last = data[len - 1];
+        offset += len;
+    }
+    return if (last == '\n') lines else lines + 1;
 }
 
 fn pathCommand(
@@ -733,38 +916,42 @@ fn getLineCol(text: []const u8, offset: usize) struct { u32, u32 } {
     return .{ line, col };
 }
 
-fn prompt(io: std.Io, str: []const u8) !enum { yes, no } {
+const Choice = enum { view, push, save, discard, quit };
+
+fn promptChoice(io: std.Io, stdin: *std.Io.File.Reader, offer_view: bool) !Choice {
     var write_buf: [300]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(io, &write_buf);
-
-    var read_buf: [100]u8 = undefined;
-    var reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
     while (true) {
-        stderr.interface.print("{s} [yes/no] ", .{str}) catch return stderr.err.?;
+        const options = if (offer_view) "[v]iew diff, " else "";
+        stderr.interface.print("\n{s}[p]ush, [s]ave for later, [d]iscard, [q]uit? ", .{options}) catch return stderr.err.?;
         stderr.interface.flush() catch return stderr.err.?;
 
-        const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
-            error.ReadFailed => return reader.err.?,
+        const line = stdin.interface.takeDelimiter('\n') catch |err| switch (err) {
+            error.ReadFailed => return stdin.err.?,
             error.StreamTooLong => errExit("input too long", .{}),
         } orelse errExit("unexpected end of stdin", .{});
-        const trimmed = std.mem.trimEnd(u8, line, "\r");
-        if (std.mem.eql(u8, trimmed, "yes")) return .yes;
-        if (std.mem.eql(u8, trimmed, "no")) return .no;
-        stderr.interface.print("\nerror: unknown response '{f}'\n", .{std.zig.fmtString(trimmed)}) catch return stderr.err.?;
+        const answer = std.mem.trim(u8, line, " \r");
+        if (answer.len == 1) switch (answer[0]) {
+            'v' => if (offer_view) return .view,
+            'p' => return .push,
+            's' => return .save,
+            'd' => return .discard,
+            'q' => return .quit,
+            else => {},
+        };
+        stderr.interface.print("error: unknown response '{f}'\n", .{std.zig.fmtString(answer)}) catch return stderr.err.?;
     }
 }
 
-fn promptLine(io: std.Io, allocator: std.mem.Allocator, str: []const u8) ![]const u8 {
+fn promptLine(io: std.Io, stdin: *std.Io.File.Reader, allocator: std.mem.Allocator, str: []const u8) ![]const u8 {
     var write_buf: [300]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(io, &write_buf);
 
     stderr.interface.print("{s}", .{str}) catch return stderr.err.?;
     stderr.interface.flush() catch return stderr.err.?;
 
-    var read_buf: [1000]u8 = undefined;
-    var reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
-    const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
-        error.ReadFailed => return reader.err.?,
+    const line = stdin.interface.takeDelimiter('\n') catch |err| switch (err) {
+        error.ReadFailed => return stdin.err.?,
         error.StreamTooLong => errExit("input too long", .{}),
     } orelse errExit("unexpected end of stdin", .{});
     const trimmed = std.mem.trimEnd(u8, line, "\r");
@@ -902,25 +1089,58 @@ fn run(
     }
 }
 
-const GitStatus = enum { clean, dirty };
-fn gitStatus(io: std.Io, repo_path: []const u8) !GitStatus {
-    const argv: []const []const u8 = &.{ "git", "-C", repo_path, "status", "--porcelain" };
+/// Runs argv and returns its stdout, which must fit in buf.
+fn runOutput(io: std.Io, buf: []u8, argv: []const []const u8) ![]const u8 {
     try logRun(io, argv, null);
     var child = try std.process.spawn(io, .{ .argv = argv, .stdout = .pipe });
     var reader = child.stdout.?.readerStreaming(io, &.{});
-    var write_buf: [1000]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &write_buf);
-    const len = reader.interface.streamRemaining(&stderr_writer.interface) catch |err| switch (err) {
+    var writer: std.Io.Writer = .fixed(buf);
+    const len = reader.interface.streamRemaining(&writer) catch |err| switch (err) {
         error.ReadFailed => return reader.err.?,
-        error.WriteFailed => return stderr_writer.err.?,
+        error.WriteFailed => errExit("{s} output exceeded {d} bytes", .{ argv[0], buf.len }),
     };
-    stderr_writer.interface.flush() catch return stderr_writer.err.?;
+    try waitSuccess(io, &child, argv);
+    return buf[0..len];
+}
+
+/// Runs argv and returns its stdout, at most `limit` bytes.
+fn runOutputAlloc(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, limit: usize) ![]u8 {
+    try logRun(io, argv, null);
+    var child = try std.process.spawn(io, .{ .argv = argv, .stdout = .pipe });
+    var reader = child.stdout.?.readerStreaming(io, &.{});
+    const output = reader.interface.allocRemaining(allocator, .limited(limit + 1)) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.StreamTooLong => errExit("{s} output exceeded {d} bytes", .{ argv[0], limit }),
+        error.OutOfMemory => |e| return e,
+    };
+    errdefer allocator.free(output);
+    try waitSuccess(io, &child, argv);
+    return output;
+}
+
+/// Runs argv and returns whether it wrote anything to stdout.
+fn runAnyOutput(io: std.Io, argv: []const []const u8) !bool {
+    try logRun(io, argv, null);
+    var child = try std.process.spawn(io, .{ .argv = argv, .stdout = .pipe });
+    var reader = child.stdout.?.readerStreaming(io, &.{});
+    const len = reader.interface.discardRemaining() catch return reader.err.?;
+    try waitSuccess(io, &child, argv);
+    return len != 0;
+}
+
+fn waitSuccess(io: std.Io, child: *std.process.Child, argv: []const []const u8) !void {
     const term = try child.wait(io);
     switch (term) {
         .exited => |code| if (code != 0) errExit("{s} exited with non-zero exit code {}", .{ argv[0], code }),
         else => errExit("{s} {f}", .{ argv[0], term }),
     }
-    return if (len == 0) .clean else .dirty;
+}
+
+fn revParse(io: std.Io, repo_path: []const u8, rev: []const u8) ![40]u8 {
+    var buf: [100]u8 = undefined;
+    const out = std.mem.trimEnd(u8, try runOutput(io, &buf, &.{ "git", "-C", repo_path, "rev-parse", "--verify", rev }), "\n");
+    if (out.len != 40 or !validSha(out[0..40])) errExit("invalid SHA '{s}' from git rev-parse {s}", .{ out, rev });
+    return out[0..40].*;
 }
 
 fn logRun(io: std.Io, argv: []const []const u8, maybe_cwd: ?[]const u8) !void {
