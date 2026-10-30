@@ -44,15 +44,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .pdb = maybe_pdb orelse errExit("missing --pdb cmdline option", .{}),
         };
     };
-    var prefix_dir = try std.Io.Dir.cwd().createDirPathOpen(io, opt.prefix, .{});
-    defer prefix_dir.close(io);
+    try std.Io.Dir.cwd().createDirPath(io, opt.prefix);
+
+    // the same directory as dof's appDataDir
+    const app_data_path = blk: {
+        const local_app_data_w = init.environ.getWindows(std.unicode.wtf8ToWtf16LeStringLiteral("LOCALAPPDATA")) orelse
+            errExit("LOCALAPPDATA is unset", .{});
+        if (local_app_data_w.len == 0) errExit("LOCALAPPDATA is empty", .{});
+        const local_app_data = try std.unicode.wtf16LeToWtf8Alloc(arena, local_app_data_w);
+        break :blk try std.fs.path.join(arena, &.{ local_app_data, "dof" });
+    };
+    var app_data_dir = try std.Io.Dir.cwd().createDirPathOpen(io, app_data_path, .{});
+    defer app_data_dir.close(io);
 
     // Installs are serialized so each file only needs one fixed temporary name
     // (<name>.new). A crash leaves at most that one file, the next install
     // overwrites it.
-    const lock_name = "dof-install.lock";
+    const lock_name = "install.lock";
     // never deleted, another install could be waiting on it
-    const lock_file = try createOrOpen(io, prefix_dir, lock_name);
+    const lock_file = try lockfile.createOrOpen(io, app_data_dir, lock_name);
     // releases the lock
     defer lock_file.close(io);
     if (!try lock_file.tryLock(io, .exclusive)) {
@@ -62,22 +72,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     try install(io, arena, opt.prefix, opt.exe);
     try install(io, arena, opt.prefix, opt.pdb);
-}
-
-/// Creates the file or opens it if it already exists. The file must never be deleted.
-///
-/// On macOS, when multiple processes (or threads) open the same nonexistent file with
-/// O_CREAT (and not O_EXCL) at once, some fail with ENOENT. With O_EXCL exactly one creates
-/// it and the others get EEXIST, then open the existing file without O_CREAT.
-/// Copied from anyzig's lockfile.zig.
-fn createOrOpen(io: std.Io, dir: std.Io.Dir, name: []const u8) std.Io.File.OpenError!std.Io.File {
-    if (dir.createFile(io, name, .{ .exclusive = true })) |file| {
-        return file;
-    } else |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => |e| return e,
-    }
-    return dir.openFile(io, name, .{});
 }
 
 fn install(io: std.Io, scratch: std.mem.Allocator, prefix: []const u8, file: []const u8) !void {
@@ -203,3 +197,4 @@ fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
 
 const builtin = @import("builtin");
 const std = @import("std");
+const lockfile = @import("lockfile.zig");

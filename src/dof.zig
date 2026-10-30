@@ -63,17 +63,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer arena.free(app_data_path);
     // std.log.info("appdata '{s}'", .{app_data_path});
     std.debug.assert(std.fs.path.isAbsolute(app_data_path));
-    try std.Io.Dir.cwd().createDirPath(io, app_data_path);
+    var app_data_dir = try std.Io.Dir.cwd().createDirPathOpen(io, app_data_path, .{});
+    defer app_data_dir.close(io);
 
     if (opt.update) {
         const src = try std.fs.path.join(arena, &.{ app_data_path, "src" });
         defer arena.free(src);
 
-        const src_lock_path = try std.mem.concat(arena, u8, &.{ src, ".lock" });
-        defer arena.free(src_lock_path);
-
         const master = blk: {
-            break :blk try fetchDofMaster(io, src, src_lock_path, arena);
+            break :blk try fetchDofMaster(io, app_data_dir, src, arena);
         };
         if (!std.mem.eql(u8, &master, &build_options.sha)) {
             std.log.info("running: {s}", .{&build_options.sha});
@@ -82,8 +80,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 io,
                 arena,
                 try init.args.toSlice(arena),
+                app_data_dir,
                 src,
-                src_lock_path,
                 &master,
             );
         }
@@ -91,9 +89,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     return switch (opt.sub_command) {
-        .none => try defaultCommand(io, arena, environ, opt.interactive, app_data_path),
-        .path => |path| try pathCommand(io, arena, app_data_path, path),
-        .branch => |branch| try branchCommand(io, arena, app_data_path, branch),
+        .none => try defaultCommand(io, arena, environ, opt.interactive, app_data_dir, app_data_path),
+        .path => |path| try pathCommand(io, arena, app_data_dir, app_data_path, path),
+        .branch => |branch| try branchCommand(io, arena, app_data_dir, app_data_path, branch),
     };
 }
 
@@ -102,15 +100,14 @@ fn defaultCommand(
     arena: std.mem.Allocator,
     environ: std.process.Environ,
     interactive: bool,
+    app_data_dir: std.Io.Dir,
     app_data_path: []const u8,
 ) !void {
     const repo_path = blk_repo_path: {
         const app_data_repo = try std.fs.path.join(arena, &.{ app_data_path, "repo" });
         defer arena.free(app_data_repo);
-        const repo_config_lock_path = try std.mem.concat(arena, u8, &.{ app_data_repo, ".lock" });
-        defer arena.free(repo_config_lock_path);
-        var repo_config_lock = try LockFile.lock(io, repo_config_lock_path);
-        defer repo_config_lock.unlock(io);
+        const repo_config_lock = try lockfile.lock(io, app_data_dir, "repo.lock");
+        defer repo_config_lock.close(io);
         const path = readFileMax(io, arena, app_data_repo, 2000) catch |err| switch (err) {
             error.FileNotFound => errExit("NO PATH! set a path with: dof path PATH", .{}),
             else => |e| return e,
@@ -126,10 +123,8 @@ fn defaultCommand(
     const branch: []const u8 = blk: {
         const app_data_branch = try std.fs.path.join(arena, &.{ app_data_path, "branch" });
         defer arena.free(app_data_branch);
-        const branch_lock_path = try std.mem.concat(arena, u8, &.{ app_data_branch, ".lock" });
-        defer arena.free(branch_lock_path);
-        var branch_lock = try LockFile.lock(io, branch_lock_path);
-        defer branch_lock.unlock(io);
+        const branch_lock = try lockfile.lock(io, app_data_dir, "branch.lock");
+        defer branch_lock.close(io);
         break :blk readFileMax(io, arena, app_data_branch, 2000) catch |err| switch (err) {
             error.FileNotFound => errExit("NO BRANCH! set a branch with: dof branch BRANCH", .{}),
             else => |e| return e,
@@ -137,8 +132,6 @@ fn defaultCommand(
     };
     defer arena.free(branch);
 
-    const repo_lock_path = try std.mem.concat(arena, u8, &.{ repo_path, ".lock" });
-    defer arena.free(repo_lock_path);
     const config_dof_path = try std.fs.path.join(arena, &.{ repo_path, "config.dof" });
     defer arena.free(config_dof_path);
 
@@ -147,8 +140,8 @@ fn defaultCommand(
             if (!interactive) errExit("repo is dirty and --non-interactive is preset", .{});
             std.log.info("repo is dirty", .{});
             {
-                var repo_lock = try LockFile.lock(io, repo_lock_path);
-                defer repo_lock.unlock(io);
+                const repo_lock = try lockfile.lock(io, app_data_dir, "dotfiles.lock");
+                defer repo_lock.close(io);
                 try runDof(io, arena, environ, repo_path, config_dof_path);
             }
             switch (try prompt(io, "dof changes applied, push?")) {
@@ -160,8 +153,8 @@ fn defaultCommand(
             }
 
             {
-                var repo_lock = try LockFile.lock(io, repo_lock_path);
-                defer repo_lock.unlock(io);
+                const repo_lock = try lockfile.lock(io, app_data_dir, "dotfiles.lock");
+                defer repo_lock.close(io);
                 try run(io, &.{ "git", "-C", repo_path, "add", "-A" }, null);
                 try run(io, &.{ "git", "-C", repo_path, "diff", "--cached", "--stat" }, null);
 
@@ -189,8 +182,8 @@ fn defaultCommand(
         },
         .clean => {
             std.log.info("repo is clean", .{});
-            var repo_lock = try LockFile.lock(io, repo_lock_path);
-            defer repo_lock.unlock(io);
+            const repo_lock = try lockfile.lock(io, app_data_dir, "dotfiles.lock");
+            defer repo_lock.close(io);
             try run(io, &.{ "git", "-C", repo_path, "fetch", "origin", branch }, null);
             try run(io, &.{ "git", "-C", repo_path, "reset", "--hard", "FETCH_HEAD" }, null);
             try runDof(io, arena, environ, repo_path, config_dof_path);
@@ -198,7 +191,13 @@ fn defaultCommand(
     }
 }
 
-fn pathCommand(io: std.Io, arena: std.mem.Allocator, app_data_path: []const u8, path_raw: []const u8) !void {
+fn pathCommand(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    app_data_dir: std.Io.Dir,
+    app_data_path: []const u8,
+    path_raw: []const u8,
+) !void {
     const path = std.mem.trimEnd(u8, path_raw, switch (builtin.os.tag) {
         .windows => "/" ++ "\\",
         else => "/",
@@ -210,11 +209,8 @@ fn pathCommand(io: std.Io, arena: std.mem.Allocator, app_data_path: []const u8, 
     const app_data_repo = try std.fs.path.join(arena, &.{ app_data_path, "repo" });
     defer arena.free(app_data_repo);
 
-    const repo_lock_path = try std.mem.concat(arena, u8, &.{ app_data_repo, ".lock" });
-    defer arena.free(repo_lock_path);
-
-    var repo_lock = try LockFile.lock(io, repo_lock_path);
-    defer repo_lock.unlock(io);
+    const repo_lock = try lockfile.lock(io, app_data_dir, "repo.lock");
+    defer repo_lock.close(io);
 
     const current_path: ?[]const u8 = blk: {
         break :blk readFileMax(io, arena, app_data_repo, 2000) catch |err| switch (err) {
@@ -238,15 +234,18 @@ fn pathCommand(io: std.Io, arena: std.mem.Allocator, app_data_path: []const u8, 
         std.log.info("dof path newly set to '{s}'", .{path});
 }
 
-fn branchCommand(io: std.Io, arena: std.mem.Allocator, app_data_path: []const u8, branch: []const u8) !void {
+fn branchCommand(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    app_data_dir: std.Io.Dir,
+    app_data_path: []const u8,
+    branch: []const u8,
+) !void {
     const app_data_branch = try std.fs.path.join(arena, &.{ app_data_path, "branch" });
     defer arena.free(app_data_branch);
 
-    const branch_lock_path = try std.mem.concat(arena, u8, &.{ app_data_branch, ".lock" });
-    defer arena.free(branch_lock_path);
-
-    var branch_lock = try LockFile.lock(io, branch_lock_path);
-    defer branch_lock.unlock(io);
+    const branch_lock = try lockfile.lock(io, app_data_dir, "branch.lock");
+    defer branch_lock.close(io);
 
     const current_branch: ?[]const u8 = blk: {
         break :blk readFileMax(io, arena, app_data_branch, 2000) catch |err| switch (err) {
@@ -792,24 +791,20 @@ fn updateExecNoreturn(
     io: std.Io,
     arena: std.mem.Allocator,
     args: []const [:0]const u8,
+    app_data_dir: std.Io.Dir,
     src: []const u8,
-    src_lock_path: []const u8,
     master: *const [40]u8,
 ) !noreturn {
     const exe = try std.process.executablePathAlloc(io, arena);
     defer arena.free(exe);
     // exe must be absolute path since we run zig from the src directory
     std.debug.assert(std.fs.path.isAbsolute(exe));
-    const exe_lock_path = try std.mem.concat(arena, u8, &.{ exe, ".lock" });
-    defer arena.free(exe_lock_path);
 
     {
-        var lock = try LockFile.lock(io, src_lock_path);
-        defer lock.unlock(io);
+        // also serializes installing the exe, which only happens here
+        const src_lock = try lockfile.lock(io, app_data_dir, "src.lock");
+        defer src_lock.close(io);
         try run(io, &.{ "git", "-C", src, "reset", "--hard", master }, null);
-        // should be safe from deadlock since lock order is always the same (src then exe)
-        var exe_lock = try LockFile.lock(io, exe_lock_path);
-        defer exe_lock.unlock(io);
         const prefix = "-Dsha=";
         var sha_arg_buf: [prefix.len + 40]u8 = undefined;
         const sha_arg = std.fmt.bufPrint(&sha_arg_buf, prefix ++ "{s}", .{master}) catch unreachable;
@@ -841,9 +836,9 @@ fn updateExecNoreturn(
     }
 }
 
-fn fetchDofMaster(io: std.Io, src: []const u8, src_lock_path: []const u8, arena: std.mem.Allocator) ![40]u8 {
-    var lock = try LockFile.lock(io, src_lock_path);
-    defer lock.unlock(io);
+fn fetchDofMaster(io: std.Io, app_data_dir: std.Io.Dir, src: []const u8, arena: std.mem.Allocator) ![40]u8 {
+    const src_lock = try lockfile.lock(io, app_data_dir, "src.lock");
+    defer src_lock.close(io);
 
     const src_exists = blk: {
         var dir = std.Io.Dir.cwd().openDir(io, src, .{}) catch |err| switch (err) {
@@ -961,7 +956,11 @@ const build_options = @import("build_options");
 const builtin = @import("builtin");
 const std = @import("std");
 const stdfix = @import("stdfix.zig");
-const LockFile = @import("LockFile.zig");
+const lockfile = @import("lockfile.zig");
+
+test {
+    _ = lockfile;
+}
 
 test "lex directive and path" {
     const text = "emacs-load-file emacs/init.el\n";
