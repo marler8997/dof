@@ -1,0 +1,78 @@
+diff --git a/os/windows.zig b/os/windows.zig
+index bdac980..d187e5b 100644
+--- a/os/windows.zig
++++ b/os/windows.zig
+@@ -3974,12 +3974,56 @@ inline fn MAKELANGID(p: c_ushort, s: c_ushort) LANGID {
+     return (s << 10) | p;
+ }
+ 
++/// The message the system has for an error code, from FormatMessageA. This avoids
++/// the binary needing the name of every code.
++const SystemMessage = struct {
++    source: union(enum) {
++        /// the system's messages, which have the Win32 errors
++        system,
++        /// a module's message table, ntdll's has the NTSTATUS codes
++        module: HMODULE,
++    },
++    code: u32,
++
++    pub fn format(m: SystemMessage, w: *std.Io.Writer) std.Io.Writer.Error!void {
++        var buf: [300]u8 = undefined;
++        const flags: DWORD, const module: ?HMODULE = switch (m.source) {
++            .system => .{ FORMAT_MESSAGE_FROM_SYSTEM, null },
++            .module => |module| .{ FORMAT_MESSAGE_FROM_HMODULE, module },
++        };
++        const len = FormatMessageA(flags | FORMAT_MESSAGE_IGNORE_INSERTS, module, m.code, 0, &buf, buf.len, null);
++        if (len == 0) return w.writeAll("no message");
++        // NTSTATUS messages are often multiple lines
++        var it = std.mem.tokenizeAny(u8, buf[0..len], "\r\n");
++        if (it.next()) |first| try w.writeAll(first);
++        while (it.next()) |line| try w.print(" {s}", .{line});
++        // messages can be arbitrarily long
++        if (len + 1 >= buf.len) try w.writeAll("...");
++    }
++};
++const FORMAT_MESSAGE_IGNORE_INSERTS = 0x200;
++const FORMAT_MESSAGE_FROM_HMODULE = 0x800;
++const FORMAT_MESSAGE_FROM_SYSTEM = 0x1000;
++extern "kernel32" fn FormatMessageA(
++    dwFlags: DWORD,
++    lpSource: ?*const anyopaque,
++    dwMessageId: DWORD,
++    dwLanguageId: DWORD,
++    lpBuffer: [*]u8,
++    nSize: DWORD,
++    Arguments: ?*anyopaque,
++) callconv(.winapi) DWORD;
++extern "kernel32" fn GetModuleHandleA(lpModuleName: [*:0]const u8) callconv(.winapi) ?HMODULE;
++
+ /// Call this when you made a windows DLL call or something that does SetLastError
+ /// and you get an unexpected error.
+ pub fn unexpectedError(err: Win32Error) UnexpectedError {
+     @branchHint(.cold);
+     if (std.options.unexpected_error_tracing) {
+-        std.debug.print("error.Unexpected: GetLastError({d}): {t}\n", .{ err, err });
++        std.debug.print("error.Unexpected: GetLastError({d}): {f}\n", .{
++            @backingInt(err),
++            SystemMessage{ .source = .system, .code = @backingInt(err) },
++        });
+         std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
+     }
+     return error.Unexpected;
+@@ -3989,9 +4033,13 @@ pub fn unexpectedError(err: Win32Error) UnexpectedError {
+ /// and you get an unexpected status.
+ pub fn unexpectedStatus(status: NTSTATUS) UnexpectedError {
+     if (std.options.unexpected_error_tracing) {
+-        std.debug.print("error.Unexpected NTSTATUS=0x{x} ({s})\n", .{
++        std.debug.print("error.Unexpected NTSTATUS=0x{x}: {f}\n", .{
+             @backingInt(status),
+-            std.enums.tagName(NTSTATUS, status) orelse "<unnamed>",
++            SystemMessage{
++                // ntdll is loaded in every process
++                .source = .{ .module = GetModuleHandleA("ntdll.dll") orelse unreachable },
++                .code = @backingInt(status),
++            },
+         });
+         std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
+     }
