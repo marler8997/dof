@@ -1,3 +1,7 @@
+pub const std_options: std.Options = .{
+    .unexpected_error_tracing = true,
+};
+
 pub fn main(init: std.process.Init.Minimal) !void {
     // the same choice std's start.zig makes for std.process.Init
     const use_safe_allocator = switch (builtin.mode) {
@@ -93,8 +97,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     return switch (opt.sub_command) {
         .none => try defaultCommand(io, arena, environ, opt.interactive, app_data_dir, app_data_path),
-        .path => |path| try pathCommand(io, arena, app_data_dir, app_data_path, path),
-        .branch => |branch| try branchCommand(io, arena, app_data_dir, app_data_path, branch),
+        .path => |path| try pathCommand(io, arena, app_data_path, path),
+        .branch => |branch| try branchCommand(io, arena, app_data_path, branch),
     };
 }
 
@@ -109,8 +113,6 @@ fn defaultCommand(
     const repo_path = blk_repo_path: {
         const app_data_repo = try std.fs.path.join(arena, &.{ app_data_path, "repo" });
         defer arena.free(app_data_repo);
-        const repo_config_lock = try lockfile.lock(io, app_data_dir, "repo.lock");
-        defer repo_config_lock.close(io);
         const path = readFileMax(io, arena, app_data_repo, 2000) catch |err| switch (err) {
             error.FileNotFound => errExit("NO PATH! set a path with: dof path PATH", .{}),
             else => |e| return e,
@@ -126,8 +128,6 @@ fn defaultCommand(
     const branch: []const u8 = blk: {
         const app_data_branch = try std.fs.path.join(arena, &.{ app_data_path, "branch" });
         defer arena.free(app_data_branch);
-        const branch_lock = try lockfile.lock(io, app_data_dir, "branch.lock");
-        defer branch_lock.close(io);
         break :blk readFileMax(io, arena, app_data_branch, 2000) catch |err| switch (err) {
             error.FileNotFound => errExit("NO BRANCH! set a branch with: dof branch BRANCH", .{}),
             else => |e| return e,
@@ -380,7 +380,6 @@ fn countLines(io: std.Io, dir: std.Io.Dir, path: []const u8) !?u64 {
 fn pathCommand(
     io: std.Io,
     arena: std.mem.Allocator,
-    app_data_dir: std.Io.Dir,
     app_data_path: []const u8,
     path_raw: []const u8,
 ) !void {
@@ -394,9 +393,6 @@ fn pathCommand(
 
     const app_data_repo = try std.fs.path.join(arena, &.{ app_data_path, "repo" });
     defer arena.free(app_data_repo);
-
-    const repo_lock = try lockfile.lock(io, app_data_dir, "repo.lock");
-    defer repo_lock.close(io);
 
     const current_path: ?[]const u8 = blk: {
         break :blk readFileMax(io, arena, app_data_repo, 2000) catch |err| switch (err) {
@@ -412,7 +408,7 @@ fn pathCommand(
         }
     }
 
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = app_data_repo, .data = path });
+    try writeAppDataFile(io, arena, app_data_path, app_data_repo, path);
 
     if (current_path) |p|
         std.log.info("dof path updated from '{s}' to '{s}'", .{ p, path })
@@ -423,15 +419,11 @@ fn pathCommand(
 fn branchCommand(
     io: std.Io,
     arena: std.mem.Allocator,
-    app_data_dir: std.Io.Dir,
     app_data_path: []const u8,
     branch: []const u8,
 ) !void {
     const app_data_branch = try std.fs.path.join(arena, &.{ app_data_path, "branch" });
     defer arena.free(app_data_branch);
-
-    const branch_lock = try lockfile.lock(io, app_data_dir, "branch.lock");
-    defer branch_lock.close(io);
 
     const current_branch: ?[]const u8 = blk: {
         break :blk readFileMax(io, arena, app_data_branch, 2000) catch |err| switch (err) {
@@ -447,7 +439,7 @@ fn branchCommand(
         }
     }
 
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = app_data_branch, .data = branch });
+    try writeAppDataFile(io, arena, app_data_path, app_data_branch, branch);
 
     if (current_branch) |p|
         std.log.info("dof branch updated from '{s}' to '{s}'", .{ p, branch })
@@ -873,6 +865,17 @@ fn appDataDir(allocator: std.mem.Allocator, environ: std.process.Environ) ![]con
     }
 }
 
+/// Replaces the file at `path` (in the app data directory) with `data` atomically, so
+/// readers see the old content or the new, never a partial file.
+fn writeAppDataFile(io: std.Io, scratch: std.mem.Allocator, app_data_path: []const u8, path: []const u8, data: []const u8) !void {
+    const tmp_path = try std.fs.path.join(scratch, &.{ app_data_path, "tmp" });
+    defer scratch.free(tmp_path);
+    var tmp_file = try TmpFile.create(io, tmp_path);
+    defer tmp_file.deinit(io);
+    try tmp_file.file.writeStreamingAll(io, data);
+    try tmp_file.finish(io, path);
+}
+
 /// Like readFileAlloc but a file of exactly `max_bytes` is allowed (readFileAlloc's
 /// limit is exclusive) and a bigger one exits with an error naming the file.
 fn readFileMax(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -1181,9 +1184,11 @@ const builtin = @import("builtin");
 const std = @import("std");
 const stdfix = @import("stdfix.zig");
 const lockfile = @import("lockfile.zig");
+const TmpFile = @import("TmpFile.zig");
 
 test {
     _ = lockfile;
+    _ = TmpFile;
 }
 
 test "lex directive and path" {

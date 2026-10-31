@@ -176,6 +176,38 @@ test "large diffs are shortened and view diff shows them in full" {
     try expectContains(result.stdout, "+line 99");
 }
 
+test "path and branch replace their settings" {
+    var f: Fixture = try .init();
+    defer f.deinit();
+    try f.commitAndPush("other", "a.txt", "2\n", "other change");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const other = try f.absPath(&path_buf, "other");
+    const result = try f.expectDof(0, "", &.{ "path", other });
+    try expectContains(result.stderr, "dof path updated from");
+    try expectContains((try f.expectDof(0, "", &.{ "path", other })).stderr, "dof path already set");
+    try expectContains((try f.expectDof(0, "", &.{ "branch", "main" })).stderr, "dof branch already set");
+    try expectContains((try f.expectDof(0, "", &.{ "branch", "dev" })).stderr, "dof branch updated from 'main' to 'dev'");
+    try expectContains((try f.expectDof(null, "", &.{})).stderr, "but dof's branch is 'dev'");
+    _ = try f.expectDof(0, "", &.{ "branch", "main" });
+
+    // applies from the new path, which has the change committed
+    _ = try f.expectDof(0, "", &.{});
+    try f.expectFile("home/a.txt", "2\n");
+
+    var tmp_dir = try f.tmp.dir.openDir(io, app_data_sub_path ++ std.fs.path.sep_str ++ "tmp", .{ .iterate = true });
+    defer tmp_dir.close(io);
+    var it = tmp_dir.iterate();
+    try std.testing.expectEqual(null, try it.next(io));
+}
+
+/// Where dof keeps its data given the fixture's environment.
+const app_data_sub_path = switch (builtin.os.tag) {
+    .windows => "localappdata\\dof",
+    .macos => "home/Library/Application Support/dof",
+    else => "home/.local/share/dof",
+};
+
 const Fixture = struct {
     tmp: std.testing.TmpDir,
     root: []const u8,
@@ -407,5 +439,6 @@ fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
 const gpa = std.testing.allocator;
 const io = std.testing.io;
 
+const builtin = @import("builtin");
 const e2e_options = @import("e2e_options");
 const std = @import("std");

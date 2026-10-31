@@ -12,6 +12,12 @@ pub fn build(b: *std.Build) void {
         .small => .small,
     };
 
+    const patched_std = b.dependency("patch", .{
+        .std_patches = &[_]std.Build.LazyPath{
+            b.path("src/windows-unexpected-error-message.patch"),
+        },
+    }).module("std");
+
     const maybe_sha = b.option([]const u8, "sha", "The SHA to embed inside the exe");
 
     const build_options = b.addOptions();
@@ -32,6 +38,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/dof.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "std", .module = patched_std }},
         }),
     });
     dof_exe.root_module.addOptions("build_options", build_options);
@@ -48,6 +55,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/dof.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "std", .module = patched_std }},
         }),
     });
     b.step("test", "Run the unit tests").dependOn(&b.addRunArtifact(test_exe).step);
@@ -63,6 +71,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/dof.zig"),
                 .target = target,
                 .optimize = optimize,
+                .imports = &.{.{ .name = "std", .module = patched_std }},
             }),
         });
         e2e_dof.root_module.addOptions("build_options", e2e_dof_options);
